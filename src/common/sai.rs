@@ -1,6 +1,6 @@
 //! Synchronous Audio Interface.
 //!
-//! [`Sai`] provides a pair of synchronous audio word streams containaing stereo data.
+//! [`Sai`] provides a pair of synchronous audio word streams containing stereo data.
 //!
 //! This driver also exposes the peripheral's lower-level, hardware-dependent audio stream
 //! configuration and FIFO pair.
@@ -78,7 +78,7 @@ pub enum MclkSource {
 /// Frame sync mode between rx/tx
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub enum SyncMode {
-    /// Both tx/rx are setup as being independent of eachother for frame sync
+    /// Both tx/rx are setup as being independent of each other for frame sync
     #[default]
     Async = 0,
     /// Tx synchronously follows Rx frame sync
@@ -107,6 +107,62 @@ pub enum BclkSource {
     Opt2 = 2,
     /// Option 3, part dependent
     Opt3 = 3,
+}
+
+bitflags::bitflags! {
+    /// Interrupt settings.
+    ///
+    /// A set bit indicates that the interrupt is enabled.
+    pub struct Interrupts : u32 {
+        /// Word Start Interrupt Enable.
+        const WORD_START = 1 << 12;
+        /// Sync Error Interrupt Enable.
+        const SYNC_ERROR = 1 << 11;
+        /// FIFO Error Interrupt Enable.
+        const FIFO_ERROR = 1 << 10;
+        /// FIFO Warning Interrupt Enable.
+        const FIFO_WARNING = 1 << 9;
+        /// FIFO Request Interrupt Enable.
+        const FIFO_REQUEST = 1 << 8;
+    }
+}
+
+bitflags::bitflags! {
+    /// Status flags.
+    pub struct Status : u32 {
+        /// Word Start Flag.
+        ///
+        /// Indicates that the start of the configured word has been detected.
+        const WORD_START = 1 << 20;
+        /// Sync Error Flag.
+        ///
+        /// Indicates that an error in the externally-generated frame sync has been detected.
+        const SYNC_ERROR = 1 << 19;
+        /// FIFO Error Flag.
+        ///
+        /// Indicates that an enabled
+        /// * receive FIFO has overflowed
+        /// * transmit FIFO has underrun
+        const FIFO_ERROR = 1 << 18;
+        /// FIFO Warning Flag.
+        ///
+        /// Indicates that an enabled
+        /// * receive FIFO is full
+        /// * transmit FIFO is empty
+        const FIFO_WARNING = 1 << 17;
+        /// FIFO Request Flag.
+        ///
+        /// Indicates that the number of words in an enabled
+        /// * receive channel FIFO is greater than the receive FIFO watermark
+        /// * transmit channel FIFO is less than or equal to the transmit FIFO watermark
+        const FIFO_REQUEST = 1 << 16;
+    }
+}
+
+impl Status {
+    const W1C: Self = Self::from_bits_truncate(
+        Self::WORD_START.bits() | Self::SYNC_ERROR.bits() | Self::FIFO_ERROR.bits(),
+    );
 }
 
 mod private {
@@ -259,60 +315,50 @@ pub struct Tx<
     _packing: PhantomData<PACKING>,
 }
 
-/// Needed for modifying the status register where some bit updates imply clearing status flags
-/// which is undesirable
-const SAI_STATUS_MASK: u32 = 0xFFE3FFFF;
-
-/// Constant mask covering all interupt mask bits
-const SAI_INT_MASK: u32 = ral::sai::TCSR::WSIE::mask
-    | ral::sai::TCSR::SEIE::mask
-    | ral::sai::TCSR::FEIE::mask
-    | ral::sai::TCSR::FWIE::mask
-    | ral::sai::TCSR::FRIE::mask;
-
 impl<const N: u8, const WORD_SIZE: u8, const FRAME_SIZE: usize, PACKING: Packing<WORD_SIZE>>
     Tx<N, WORD_SIZE, FRAME_SIZE, PACKING>
 {
     /// Enable/Disable transmission
     pub fn set_enable(&mut self, en: bool) {
-        let mut tcsr = ral::read_reg!(ral::sai, self.sai, TCSR) & SAI_STATUS_MASK;
+        let mut tcsr = ral::read_reg!(ral::sai, self.sai, TCSR) & !Status::W1C.bits();
         if en {
             tcsr |= ral::sai::TCSR::TE::mask
         } else {
             tcsr &= !ral::sai::TCSR::TE::mask
         }
         ral::write_reg!(ral::sai, self.sai, TCSR, tcsr);
-        self.clear_status();
+        self.clear_status(Status::W1C);
     }
 
-    /// Mask/Unmask interrupts, takes the full set of mask values to update
-    /// and modifies them wholesale clearing and setting interrupt bits.
+    /// Return the interrupt flags.
     ///
-    /// ```no_run
-    /// use imxrt_ral::sai::{SAI1, TCSR};
-    /// use imxrt_hal::sai::{Tx, PackingNone, Sai, SaiConfig};
-    /// let sai = Sai::without_pins(unsafe { SAI1::instance() }, 0, 0);
-    /// let (Some(mut sai_tx), None) = sai.split::<16, 2, PackingNone>(&SaiConfig::i2s(8)) else { panic!() };
-    ///
-    /// sai_tx.set_int_mask(TCSR::FEIE::mask | TCSR::FWIE::mask | TCSR::FRIE::mask);
-    /// ```
-    pub fn set_int_mask(&mut self, mask: u32) {
-        let mut tcsr = ral::read_reg!(ral::sai, self.sai, TCSR) & !SAI_INT_MASK;
-        tcsr |= mask & SAI_INT_MASK;
-        ral::write_reg!(ral::sai, self.sai, TCSR, tcsr);
+    /// The interrupt flags indicate the reasons that this peripheral may generate an interrupt.
+    pub fn interrupts(&self) -> Interrupts {
+        let tcsr = ral::read_reg!(ral::sai, self.sai, TCSR);
+        Interrupts::from_bits_truncate(tcsr)
     }
 
-    /// Get the status register of the transmitter, this can be used in conjuction with
+    /// Set the interrupt flags for this SAI transmitter.
+    pub fn set_interrupts(&mut self, interrutps: Interrupts) {
+        ral::modify_reg!(ral::sai, self.sai, TCSR, |tcsr| {
+            let tcsr = tcsr & !Interrupts::all().bits();
+            tcsr | interrutps.bits()
+        })
+    }
+
+    /// Get the status register of the transmitter, this can be used in conjunction with
     /// status field masks to determine the state of the SAI peripheral.
-    pub fn status(&mut self) -> u32 {
-        ral::read_reg!(ral::sai, self.sai, TCSR)
+    pub fn status(&mut self) -> Status {
+        let tcsr = ral::read_reg!(ral::sai, self.sai, TCSR);
+        Status::from_bits_truncate(tcsr)
     }
 
     /// Clear status error flags
-    pub fn clear_status(&mut self) {
-        let mut tcsr = ral::read_reg!(ral::sai, self.sai, TCSR) & SAI_STATUS_MASK;
-        tcsr |= ral::sai::TCSR::FEF::mask | ral::sai::TCSR::WSF::mask | ral::sai::TCSR::SEF::mask;
-        ral::write_reg!(ral::sai, self.sai, TCSR, tcsr);
+    pub fn clear_status(&mut self, flags: Status) {
+        let flags = flags & Status::W1C;
+        ral::modify_reg!(ral::sai, self.sai, TCSR, |tcsr| {
+            tcsr | flags.bits()
+        });
     }
 
     /// Get a dump of the Tx configuration registers

@@ -94,7 +94,7 @@ mod app {
     }
 
     #[init]
-    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+    fn init(cx: init::Context) -> (Shared, Local) {
         let mut cortex_m = cx.core;
         let (
             board::Common {
@@ -151,7 +151,9 @@ mod app {
             sai1_tx.write_frame(0, [sine(counter), square(counter)]);
             counter += 1;
         }
-        sai1_tx.set_int_mask(imxrt_ral::sai::TCSR::FWIE::mask | imxrt_ral::sai::TCSR::FRIE::mask);
+        sai1_tx.set_interrupts(
+            hal::sai::Interrupts::FIFO_WARNING | hal::sai::Interrupts::FIFO_REQUEST,
+        );
         sai1_tx.set_enable(true);
         (
             Shared { sai1_tx },
@@ -161,18 +163,15 @@ mod app {
                 audio_pit,
                 counter,
             },
-            init::Monotonics(),
         )
     }
 
     #[task(binds = BOARD_SAI1, shared = [sai1_tx], local = [counter], priority = 2)]
     fn sai1_interrupt(mut cx: sai1_interrupt::Context) {
-        let sai1_interrupt::LocalResources { counter } = cx.local;
-
-        let mask: u32 = imxrt_ral::sai::TCSR::FRF::mask;
+        let sai1_interrupt::LocalResources { counter, .. } = cx.local;
 
         cx.shared.sai1_tx.lock(|sai1_tx| {
-            while sai1_tx.status() & mask != 0 {
+            while sai1_tx.status().contains(hal::sai::Status::FIFO_REQUEST) {
                 sai1_tx.write_frame(0, [sine(*counter), square(*counter)]);
                 *counter = (*counter).wrapping_add(1);
             }
@@ -196,8 +195,8 @@ mod app {
 
         defmt::println!(
             "Audio synthesis tx status {:#x}, fifo underrun? {}, write pos {}, read pos {}",
-            status,
-            status & imxrt_ral::sai::TCSR::FEF::mask != 0,
+            status.bits(),
+            status.contains(hal::sai::Status::FIFO_ERROR),
             write_pos,
             read_pos,
         );
